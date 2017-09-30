@@ -49,7 +49,12 @@ char device_id[10];
 
 // 实时通信引擎设备信息请求串
 String deviceInfo;
-
+// 重置wifi串
+String resetStr;
+// 数据更新串
+String dataChanged;
+// 设备状态串
+String connections;
 // 默认不重置
 String reset = "0";
 String resetConfig = "/reset.json";
@@ -67,6 +72,8 @@ String deviceIdKey = "deviceId";
 int pinModeArrays[10];
 
 bool connectInternet = true;
+
+int requestTotal = 0;
 
 //WiFiManager
 //Local intialization. Once its business is done, there is no need to keep it around
@@ -88,16 +95,12 @@ void setup() {
     // wait serial port initialization
   }
 
+  //exit after config instead of connecting
+  //  wifiManager.setBreakAfterConfig(true);
+
   //clean FS, for testing
   //  SPIFFS.format();
-
-  // Memory pool for JSON object tree.
-  //
-  // Inside the brackets, 200 is the size of the pool in bytes,
-  // If the JSON object is more complex, you need to increase that value.
-  // See https://bblanchon.github.io/ArduinoJson/assistant/
-  StaticJsonBuffer<500> jsonBuffer;
-
+  Serial.println("start setup");
   // 设置AP模式下led灯
   pinMode(ledAPPin, OUTPUT);
 
@@ -140,8 +143,9 @@ void setup() {
   if (!wifiManager.autoConnect()) {
     Serial.println("failed to connect and hit timeout");
     //reset and try again, or maybe put it to deep sleep
+    delay(3000);
     ESP.reset();
-    delay(1000);
+    delay(5000);
   }
   // 连接成功后清除定时器
   ticker.detach();
@@ -152,8 +156,6 @@ void setup() {
   Serial.println();
   Serial.print("connected: ");
   Serial.println(WiFi.localIP());
-
-
 
   //read updated parameters
   strcpy(wilddog_host, cus_wilddog_host.getValue());
@@ -186,8 +188,10 @@ void setup() {
   // 开始firebase
   Firebase.begin(wilddog_host, "");
   // 获取device id，初始化数据
-  deviceInfo = "device/" + String((char *)device_id);
-
+  deviceInfo = "/gpio/" + String((char *)device_id);
+  resetStr = "/device/" + String((char *)device_id) + "/reset";
+  dataChanged = "/device/" + String((char *)device_id) + "/changed";
+  connections = "/device/" + String((char *)device_id) + "/connections";
   // loop from the lowest pin to the highest:
   for (int i = 0; i < 10; i++) {
     pinModeArrays[i] = 0;
@@ -199,85 +203,101 @@ void setup() {
 
 void resetESP() {
   writeConfig(resetConfig, resetKey, "1");
+  delay(3000);
   ESP.reset();
-  delay(1000);
+  delay(5000);
 }
 
 void loop() {
-  Serial.print("deviceInfo: ");
+  Serial.print("deviceInfo String: ");
   Serial.println(deviceInfo);
+  Serial.print("dataChanged String: ");
+  Serial.println(dataChanged);
+  if (requestTotal % 300 == 0) {
+    // 一分钟更新一次状态，告知服务器自己在线
+    Firebase.set(connections, true);
+    if(requestTotal >= 300){
+      requestTotal = 0;
+    }
+  }
+  requestTotal = requestTotal + 1;
+
+  int changed = Firebase.getInt(dataChanged);
+
+  if (Firebase.failed()) {
+    Serial.println("Firebase get data changed failed");
+    Serial.println(Firebase.error());
+    ticker.attach(2, tick);
+    connectInternet = false;
+    return;
+  } else {
+    if (!connectInternet) {
+      ticker.detach();
+      connectInternet = true;
+    }
+    if (changed == 0) {
+      // 没有数据更新，延迟200ms再查看是否有数据更新
+      delay(200);
+      return;
+    }
+    // 已收到更新数据通知，重置为未更新数据状态
+    Firebase.set(dataChanged, 0);
+    //通知设备我在线
+    Firebase.set(connections, true);
+  }
   int count = 0;
+  Serial.print("root:");
   FirebaseObject root = Firebase.get(deviceInfo);
+
   if (Firebase.failed()) {
     Serial.println("Firebase get failed");
     Serial.println(Firebase.error());
     ticker.attach(2, tick);
     connectInternet = false;
     return;
-  }else{
-    if(!connectInternet){
+  } else {
+    if (!connectInternet) {
       ticker.detach();
       connectInternet = true;
     }
   }
 
-  int resetServer = root.getInt("reset");
-  if (resetServer == 1) {
-    Firebase.set(deviceInfo + "/reset", 0);
+  bool resetBool = Firebase.getBool(resetStr);
+  Serial.print("resetBool : ");
+  Serial.println(resetBool);
+  if (resetBool) {
+    Firebase.set(resetStr, false);
     // 写入到配置文件中
     Serial.println("saving device config");
     writeConfig(resetConfig, resetKey, "1");
-    ESP.restart();
+    delay(3000);
+    ESP.reset();
+    delay(5000);
     return;
   }
 
-  JsonVariant peripheralJV = root.getJsonVariant("peripheral");
+  JsonVariant peripheralJV = root.getJsonVariant();
   for ( const auto& kv : peripheralJV.as<JsonObject>() ) {
     // 获取peripheral下包含的开关实例
     Serial.println(kv.key);
-    int pGpio = -1;
     // 其kv.value作为jsonObject对象处理，即开关实例
-    for ( const auto& pin : kv.value.as<JsonObject>() ) {
-      String key = String((char *)pin.key);
-      if (String("pGpio").equals(key)) {
-        pGpio = pin.value.as<int>();
-        Serial.print("pGpio:");
-        Serial.print(pGpio);
-        Serial.print(" ");
-        if (pinModeArrays[count] == 0) {
-          // 不能多次设置引脚输入输出状态
-          pinMode(pGpio, OUTPUT);
-          pinModeArrays[count] = 1;
-        }
-        count = count + 1;
-      } else if (String("pStatus").equals(key)) {
-        bool pStatus = pin.value.as<bool>();
-        Serial.print("pStatus:");
-        Serial.println(pStatus);
-        // gpio号如果为-1，则不设置其值，是无效的gpio号
-        if (pGpio != -1) {
-          digitalWrite(pGpio, pStatus);
-        }
-      }
+    JsonObject& peripheral = kv.value.as<JsonObject>();
+    String gpioStr = peripheral["gpio"];
+    int gpio = gpioStr.toInt();
+    Serial.print("gpio:");
+    Serial.println(gpio);
+    if (pinModeArrays[count] == 0) {
+      // 不能多次设置引脚输入输出状态
+      pinMode(gpio, OUTPUT);
+      pinModeArrays[count] = 1;
     }
+    count = count + 1;
 
-    //    String pInfo = deviceInfo + "/peripheral/" + String((char *)kv.key);
-    //    Serial.print("pInfo:");
-    //    Serial.println(pInfo);
-    //    FirebaseObject peripheral = Firebase.get(pInfo);
-    //    int pGpio = peripheral.getInt("pGpio");
-    //    Serial.print("pGpio:");
-    //    Serial.println(pGpio);
-    //    if(pinModeArrays[count] == 0){
-    //      // 不能多次设置引脚输入输出状态
-    //      pinMode(pGpio, OUTPUT);
-    //      pinModeArrays[count] = 1;
-    //     }
-    //    count = count + 1;
-    //    bool pStatus = peripheral.getBool("pStatus");
-    //    Serial.print("pStatus:");
-    //    Serial.println(pStatus);
-    //    digitalWrite(pGpio, pStatus);
+    bool status = peripheral["status"];
+    Serial.print("status:");
+    Serial.print(status);
+    // gpio号如果为-1，则不设置其值，是无效的gpio号
+    digitalWrite(gpio, status);
 
   }
 
@@ -285,6 +305,7 @@ void loop() {
   delay(200);
 }
 
+// 写配置文件
 void writeConfig(String config_file, String key, String value) {
   DynamicJsonBuffer jsonBuffer;
   JsonObject& json = jsonBuffer.createObject();
@@ -302,6 +323,7 @@ void writeConfig(String config_file, String key, String value) {
   //end save
 }
 
+// 读取配置文件
 char* readConfig(String config_file, String key) {
   char result[50] = "";
   if (SPIFFS.begin()) {
