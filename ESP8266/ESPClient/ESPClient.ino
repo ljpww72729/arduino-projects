@@ -30,6 +30,10 @@
 #include <ESP8266WebServer.h>
 #include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager
 
+#include <ESP8266HTTPClient.h>
+
+#define USE_SERIAL Serial
+
 // for AP LED status
 #include <Ticker.h>
 Ticker ticker;
@@ -46,6 +50,7 @@ void tick()
 // 从配置页面获取host及device id，用于连接野狗
 char wilddog_host[50];
 char device_id[10];
+char changed_url[100];
 
 // 实时通信引擎设备信息请求串
 String deviceInfo;
@@ -67,6 +72,10 @@ String hostKey = "host";
 // deviceId值
 String deviceIdConfig = "/deviceId.json";
 String deviceIdKey = "deviceId";
+
+// data changed 监听地址
+String changedUrlConfig = "/changedUrl.json";
+String changedUrlKey = "changedUrl";
 
 // 防止多次初始化引脚输入输出状态导致崩溃
 int pinModeArrays[10];
@@ -123,11 +132,13 @@ void setup() {
     wifiManager.resetSettings();
   }
 
+  //  wifiManager.resetSettings();
   // The extra parameters to be configured (can be either global or just in the setup)
   // After connecting, parameter.getValue() will get you the configured value
   // id/name placeholder/prompt default length
   WiFiManagerParameter cus_wilddog_host("wilddogHost", "wilddog host", readConfig(hostConfig, hostKey), 50);
   WiFiManagerParameter cus_device_id("dId", "device id", readConfig(deviceIdConfig, deviceIdKey), 10);
+  WiFiManagerParameter cus_changed_url("changedUrl", "data changed url", readConfig(changedUrlConfig, changedUrlKey), 100);
 
   //set callback that gets called when connecting to previous WiFi fails, and enters Access Point mode
   wifiManager.setAPCallback(configModeCallback);
@@ -135,6 +146,7 @@ void setup() {
   //add all your parameters here
   wifiManager.addParameter(&cus_wilddog_host);
   wifiManager.addParameter(&cus_device_id);
+  wifiManager.addParameter(&cus_changed_url);
 
   //fetches ssid and pass and tries to connect
   //if it does not connect it starts an access point with the specified name
@@ -160,10 +172,13 @@ void setup() {
   //read updated parameters
   strcpy(wilddog_host, cus_wilddog_host.getValue());
   strcpy(device_id, cus_device_id.getValue());
+  strcpy(changed_url, cus_changed_url.getValue());
   Serial.print("wilddog_host: ");
   Serial.println(wilddog_host);
   Serial.print("device_id: ");
   Serial.println(device_id);
+  Serial.print("changed_url: ");
+  Serial.println(changed_url);
   Serial.println();
 
   // 如果获取到的参数为空，则重置wifi并重新配置
@@ -178,6 +193,13 @@ void setup() {
   device_id_trim.trim();
   if (device_id_trim.length() == 0) {
     Serial.println("device_id is empty!");
+    resetESP();
+    return;
+  }
+  String changed_url_trim = String(changed_url);
+  changed_url_trim.trim();
+  if (changed_url_trim.length() == 0) {
+    Serial.println("changed_url is empty!");
     resetESP();
     return;
   }
@@ -198,6 +220,7 @@ void setup() {
   }
   writeConfig(deviceIdConfig, deviceIdKey, String((char *)device_id));
   writeConfig(hostConfig, hostKey, String((char *)wilddog_host));
+  writeConfig(changedUrlConfig, changedUrlKey, String((char *)changed_url));
 
 }
 
@@ -207,7 +230,7 @@ void resetESP() {
   ESP.reset();
   delay(5000);
 }
-
+const char* host = "192.168.31.128";
 void loop() {
   Serial.print("deviceInfo String: ");
   Serial.println(deviceInfo);
@@ -215,20 +238,66 @@ void loop() {
   Serial.println(dataChanged);
   if (requestTotal % 300 == 0) {
     // 一分钟更新一次状态，告知服务器自己在线
-    Firebase.set(connections, true);
-    if(requestTotal >= 300){
+    notifyDeviceOnline();
+    if (requestTotal >= 300) {
       requestTotal = 0;
     }
   }
   requestTotal = requestTotal + 1;
 
-  int changed = Firebase.getInt(dataChanged);
+  //是否从云端获取数据更新
+  bool getChangedFromRealtimeData = false;
 
-  if (Firebase.failed()) {
-    Serial.println("Firebase get data changed failed");
-    Serial.println(Firebase.error());
-    ticker.attach(2, tick);
+  bool getChangedSucceed = false;
+
+  int changed = 0;
+
+  if (getChangedFromRealtimeData) {
+    // 1. 从云端直接获取数据是否更改
+    changed = Firebase.getInt(dataChanged);
+    if (Firebase.failed()) {
+      Serial.println("Firebase get data changed failed");
+      Serial.println(Firebase.error());
+    } else {
+      // 已收到更新数据通知，重置为未更新数据状态
+      Firebase.set(dataChanged, 0);
+      getChangedSucceed = true;
+    }
+  } else {
+    // 2. 访问Android Things获取数据是否更改
+    HTTPClient httpClient;
+    Serial.println("[HTTP] begin...\n");
+    Serial.println(String((char *)changed_url));
+    // configure traged server and url
+    httpClient.begin(changed_url); //HTTP
+    // start connection and send HTTP header
+    int httpCode = httpClient.GET();
+    // httpCode will be negative on error
+    if (httpCode > 0) {
+      // HTTP header has been send and Server response header has been handled
+      USE_SERIAL.printf("[HTTP] GET... code: %d\n", httpCode);
+      // file found at server
+      if (httpCode == HTTP_CODE_OK) {
+        String resp = httpClient.getString();
+        USE_SERIAL.println(resp);
+        changed = resp.toInt();
+        getChangedSucceed = true;
+      } else {
+        USE_SERIAL.printf("[HTTP] GET... NOT OK, error: %s\n", httpClient.errorToString(httpCode).c_str());
+      }
+    } else {
+      USE_SERIAL.printf("[HTTP] GET... failed, error: %s\n", httpClient.errorToString(httpCode).c_str());
+    }
+    httpClient.end();
+  }
+
+  if (!getChangedSucceed) {
+    if (connectInternet) {
+      ticker.attach(0.5, tick);
+    }
     connectInternet = false;
+    // 请求失败后延迟2秒再请求
+    delay(2000);
     return;
   } else {
     if (!connectInternet) {
@@ -240,10 +309,8 @@ void loop() {
       delay(200);
       return;
     }
-    // 已收到更新数据通知，重置为未更新数据状态
-    Firebase.set(dataChanged, 0);
     //通知设备我在线
-    Firebase.set(connections, true);
+    notifyDeviceOnline();
   }
   int count = 0;
   Serial.print("root:");
@@ -252,7 +319,7 @@ void loop() {
   if (Firebase.failed()) {
     Serial.println("Firebase get failed");
     Serial.println(Firebase.error());
-    ticker.attach(2, tick);
+    ticker.attach(0.5, tick);
     connectInternet = false;
     return;
   } else {
@@ -303,6 +370,13 @@ void loop() {
 
   // 每200毫秒更新一次数据
   delay(200);
+}
+
+void notifyDeviceOnline() {
+  // 先false再true是为了让主机更新日期
+  Firebase.set(connections, false);
+  delay(100);
+  Firebase.set(connections, true);
 }
 
 // 写配置文件
